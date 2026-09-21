@@ -1,0 +1,31 @@
+# Chromium / depot_tools worktrees (never commit)
+out/
+depot_tools/
+work/
+chromium/
+src/
+
+# Local build / pack outputs
+*.7z
+*.zip
+!docs/**/*.zip
+*.pdb
+*.obj
+*.lib
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+
+# Node / OS
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.nexora.env
+
+# IDE
+.vs/
+.vscode/
+*.user

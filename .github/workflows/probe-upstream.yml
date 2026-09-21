@@ -1,0 +1,73 @@
+name: Probe upstream win-arm64 zips
+
+on:
+  schedule:
+    # Weekly Monday 03:17 UTC
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: HEAD-check public URLs
+        id: head
+        run: |
+          set +e
+          urls=(
+            "https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/win-arm64/chrome-win-arm64.zip"
+            "https://cdn.playwright.dev/builds/chromium/1234/chromium-win-arm64.zip"
+            "https://cdn.playwright.dev/builds/chromium/1234/chromium-win32_arm64.zip"
+          )
+          any=0
+          report=""
+          for u in "${urls[@]}"; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -I -L --max-time 30 "$u" || echo "000")
+            line="$code  $u"
+            echo "$line"
+            report+="$line"$'\n'
+            if [ "$code" = "200" ]; then
+              any=1
+            fi
+          done
+          {
+            echo "any_200=$any"
+            echo "report<<EOF"
+            echo "$report"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update issue if any URL is 200
+        if: steps.head.outputs.any_200 == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT: ${{ steps.head.outputs.report }}
+        run: |
+          title='Upstream win-arm64 zip became available (Playwright 1.62 / 151.0.7922.34)'
+          body=$(cat <<MD
+          ## Upstream probe hit HTTP 200
+
+          Official CFT/Playwright win-arm64 zip(s) appear available. Prefer downloading instead of self-building.
+
+          \`\`\`
+          $REPORT
+          \`\`\`
+
+          Pin remains Playwright **1.62.0** / revision **1234** / tag **151.0.7922.34**.
+          Layout must stay \`chromium-1234/chrome-win64/chrome.exe\` with PE **AA64**.
+          MD
+          )
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title Upstream win-arm64 zip" --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment -R "$GITHUB_REPOSITORY" "$existing" --body "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+      - name: No 200
+        if: steps.head.outputs.any_200 != '1'
+        run: echo "All probed URLs still non-200; self-build still required."
