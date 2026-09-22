@@ -11,6 +11,16 @@ Do **not** change these pins. Do **not** redistribute Google Chrome / Edge from 
 
 CI: GitHub-hosted Windows ARM — default `windows-11-vs2026-arm` (AtlasGraph reference: `windows-11-arm`, see https://github.com/xjfyt/AtlasGraph/blob/master/.github/workflows/release.yml). Disk is tight; scripts reclaim aggressively. Do **not** silently switch runners on disk failure.
 
+
+## CI multi-stage + cache (hosted)
+
+GitHub-hosted jobs stop at **6 hours**. Do not set `timeout-minutes: 720` expecting a longer run.
+
+- Workflow: `probe` → `sync` (SKIP_BUILD, warm `GCLIENT_CACHE_DIR`) → `build` (restore cache, compile, pack, release).
+- Actions cache holds **depot_tools + gclient object cache** only. Full `src/` is too large for cache/artifacts.
+- Env: `GCLIENT_CACHE_DIR` / `GIT_CACHE_PATH`; `DELETE_GIT_AFTER_SYNC=1` removes `.git` **without** `git gc --aggressive`.
+- Optional workflow input `skip_sync_job` skips the warm job (build still syncs).
+
 Automated: `scripts/build-chromium-win-arm64.ps1` (sections 2–4) then `scripts/pack-playwright-layout.mjs`.
 
 ---

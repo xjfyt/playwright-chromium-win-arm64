@@ -19,6 +19,16 @@ Official CFT / Playwright **win-arm64** zips are **404**. This repo compiles Chr
 
 **Default build label here:** `windows-11-vs2026-arm` (VS 2026 + MSVC ARM64, better for Chromium). Workflow input can switch to `windows-11-arm` to match AtlasGraph exactly. **Do not** use self-hosted unless you choose to; **do not** redistribute Google Chrome / Edge.
 
+## CI pipeline (multi-stage)
+
+Hosted Actions jobs hard-cap at **6 hours** (`timeout-minutes` above 360 does not help). Full Chromium src does **not** fit in Actions cache/artifacts (~10GB).
+
+1. **probe** — HEAD-check official win-arm64 zips  
+2. **sync** — `gclient` sync + warm `depot_tools` / gclient object cache (Actions cache; save may fail if >~10GB)  
+3. **build** — restore cache, sync again (faster on hit), compile `chrome`, pack, Release  
+
+Also: when `DELETE_GIT_AFTER_SYNC=1`, skip `git gc --aggressive` and delete `.git` immediately (aggressive gc burned ~4h with no compile on run 35622650851).
+
 Hosted ARM images have **tight disk** (~14 GB free is common). Scripts use aggressive reclaim (`symbol_level=0`, no pdb, optional delete `.git` after sync). If the job fails on disk, keep the label and inspect logs — do not silently change runners.
 
 **No binary ships in git.** Trigger **Build Windows ARM64 Chromium** after push.

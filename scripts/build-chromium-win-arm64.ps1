@@ -10,9 +10,11 @@
   Env:
     DEPOT_TOOLS   - path to depot_tools (default: $env:RUNNER_TEMP\depot_tools or D:\depot_tools)
     CHROMIUM_ROOT - parent of src/ (default: $env:RUNNER_TEMP\chromium or D:\chromium)
+    GCLIENT_CACHE_DIR - optional git/gclient object cache (speeds re-sync across CI jobs)
     SKIP_FETCH    - "1" to skip fetch/sync when checkout exists
     SKIP_BUILD    - "1" to skip gn/autoninja
     AGGRESSIVE_DISK - "1" (default on CI) reclaim disk after sync / mid-build
+    DELETE_GIT_AFTER_SYNC - "1" remove src\.git after sync (skip slow git gc)
 
   Does NOT pack; run scripts/pack-playwright-layout.mjs afterwards.
 #>
@@ -30,10 +32,11 @@ function Default-Scratch([string]$name) {
 $DepotTools = if ($env:DEPOT_TOOLS) { $env:DEPOT_TOOLS } else { Default-Scratch 'depot_tools' }
 $ChromiumRoot = if ($env:CHROMIUM_ROOT) { $env:CHROMIUM_ROOT } else { Default-Scratch 'chromium' }
 $Src = Join-Path $ChromiumRoot 'src'
+$GclientCache = if ($env:GCLIENT_CACHE_DIR) { $env:GCLIENT_CACHE_DIR } else { $null }
 $Aggressive = if ($null -ne $env:AGGRESSIVE_DISK -and $env:AGGRESSIVE_DISK -ne '') { $env:AGGRESSIVE_DISK } else { if ($env:GITHUB_ACTIONS) { '1' } else { '0' } }
 
-function Write-Info([string]$msg) { Write-Host "[INFO] $msg" }
-function Write-Warn([string]$msg) { Write-Host "[WARN] $msg" -ForegroundColor Yellow }
+function Write-Info([string]$msg) { Write-Host ("[INFO] {0} {1}" -f (Get-Date -Format 'o'), $msg) }
+function Write-Warn([string]$msg) { Write-Host ("[WARN] {0} {1}" -f (Get-Date -Format 'o'), $msg) -ForegroundColor Yellow }
 
 function Show-Disk {
   Get-PSDrive -PSProvider FileSystem | ForEach-Object {
@@ -55,31 +58,39 @@ function Ensure-DepotTools {
     $parent = Split-Path $DepotTools -Parent
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DepotTools
+    if ($LASTEXITCODE -ne 0) { throw "git clone depot_tools failed: $LASTEXITCODE" }
   }
   $env:Path = "$DepotTools;" + $env:Path
   $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
-  # Prefer local VS; shrink downloads
   $env:GCLIENT_PY3 = '1'
+  if ($GclientCache) {
+    New-Item -ItemType Directory -Force -Path $GclientCache | Out-Null
+    $env:GIT_CACHE_PATH = $GclientCache
+    Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache"
+  }
   Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0"
   & gclient --version 2>$null | Out-Host
 }
 
 function Reclaim-AfterSync {
   if ($Aggressive -ne '1') { return }
-  Write-Info "Aggressive disk reclaim after sync"
+  Write-Info "Disk reclaim after sync (start)"
+  Show-Disk
   Push-Location $Src
   try {
-    # Drop git object packing weight; keep working tree
     if (Test-Path '.git') {
-      git reflog expire --expire=now --all 2>$null
-      git gc --prune=now --aggressive 2>$null
-      # Last resort on tiny runners: remove .git (cannot re-sync easily)
       if ($env:DELETE_GIT_AFTER_SYNC -eq '1') {
-        Write-Warn "DELETE_GIT_AFTER_SYNC=1 — removing src\.git"
+        # CRITICAL: do NOT run git gc --aggressive first — it can take many hours on
+        # a full Chromium tree and burned the remaining wall clock on run 35622650851.
+        Write-Warn "DELETE_GIT_AFTER_SYNC=1 — removing src\.git immediately (skip git gc)"
         Remove-Item -Recurse -Force '.git'
+        Write-Info "src\.git removed"
+      } else {
+        Write-Info "Running lightweight git prune (no --aggressive)"
+        git reflog expire --expire=now --all 2>$null
+        git gc --prune=now 2>$null
       }
     }
-    # Common bulky caches not needed to link chrome
     @(
       'third_party\llvm-build\Release+Asserts\lib',
       'third_party\rust-toolchain\lib\rustlib\src'
@@ -92,6 +103,7 @@ function Reclaim-AfterSync {
   } finally {
     Pop-Location
   }
+  Write-Info "Disk reclaim after sync (done)"
   Show-Disk
 }
 
@@ -100,41 +112,75 @@ function Ensure-ChromiumCheckout {
   New-Item -ItemType Directory -Force -Path $ChromiumRoot | Out-Null
   Show-Disk
 
+  $fetchArgs = @('--nohooks', 'chromium')
+  $syncArgs = @('sync', '--with_branch_heads', '--with_tags')
+  if ($GclientCache) {
+    $fetchArgs = @('--nohooks', '--cache-dir', $GclientCache, 'chromium')
+    $syncArgs = @('sync', '--with_branch_heads', '--with_tags', '--cache-dir', $GclientCache)
+  }
+
   if ($env:SKIP_FETCH -eq '1' -and (Test-Path $Src)) {
     Write-Warn "SKIP_FETCH=1 — using existing checkout"
-  } elseif (-not (Test-Path (Join-Path $Src '.git'))) {
+  } elseif (-not (Test-Path (Join-Path $Src '.git')) -and -not (Test-Path (Join-Path $Src 'BUILD.gn'))) {
     Push-Location $ChromiumRoot
     try {
-      Write-Info "fetch --nohooks chromium (long)..."
-      & fetch --nohooks chromium
+      Write-Info ("fetch {0} (long)..." -f ($fetchArgs -join ' '))
+      & fetch @fetchArgs
       if ($LASTEXITCODE -ne 0) { throw "fetch chromium failed: $LASTEXITCODE" }
     } finally {
       Pop-Location
+    }
+  } elseif (-not (Test-Path (Join-Path $Src '.git')) -and (Test-Path (Join-Path $Src 'BUILD.gn'))) {
+    Write-Warn "src exists without .git (prior DELETE_GIT_AFTER_SYNC); re-fetch required unless SKIP_FETCH=1"
+    if ($env:SKIP_FETCH -eq '1') {
+      Write-Warn "SKIP_FETCH=1 with no .git — continuing with working tree only"
+    } else {
+      Push-Location $ChromiumRoot
+      try {
+        if (Test-Path $Src) {
+          Write-Info "Removing incomplete src for clean fetch"
+          Remove-Item -Recurse -Force $Src
+        }
+        Write-Info ("fetch {0} (long)..." -f ($fetchArgs -join ' '))
+        & fetch @fetchArgs
+        if ($LASTEXITCODE -ne 0) { throw "fetch chromium failed: $LASTEXITCODE" }
+      } finally {
+        Pop-Location
+      }
     }
   } else {
     Write-Info "Chromium src already present"
   }
 
+  if ($env:SKIP_FETCH -eq '1') {
+    Reclaim-AfterSync
+    return
+  }
+
   Push-Location $Src
   try {
-    $current = (git describe --tags --exact-match 2>$null)
-    if ($current -ne $ChromeTag) {
-      Write-Info "Checking out tag $ChromeTag"
-      git fetch origin tag $ChromeTag 2>$null
-      if ($LASTEXITCODE -ne 0) {
-        git fetch https://chromium.googlesource.com/chromium/src.git "+refs/tags/${ChromeTag}:refs/tags/${ChromeTag}"
-        if ($LASTEXITCODE -ne 0) { throw "git fetch tag $ChromeTag failed" }
+    if (Test-Path '.git') {
+      $current = (git describe --tags --exact-match 2>$null)
+      if ($current -ne $ChromeTag) {
+        Write-Info "Checking out tag $ChromeTag"
+        git fetch origin tag $ChromeTag 2>$null
+        if ($LASTEXITCODE -ne 0) {
+          git fetch https://chromium.googlesource.com/chromium/src.git "+refs/tags/${ChromeTag}:refs/tags/${ChromeTag}"
+          if ($LASTEXITCODE -ne 0) { throw "git fetch tag $ChromeTag failed" }
+        }
+        git checkout $ChromeTag
+        if ($LASTEXITCODE -ne 0) { throw "git checkout $ChromeTag failed" }
+      } else {
+        Write-Info "Already on $ChromeTag"
       }
-      git checkout $ChromeTag
-      if ($LASTEXITCODE -ne 0) { throw "git checkout $ChromeTag failed" }
     } else {
-      Write-Info "Already on $ChromeTag"
+      Write-Warn "No .git — skipping tag checkout; assuming working tree matches $ChromeTag"
     }
-    if ($env:SKIP_FETCH -ne '1') {
-      Write-Info "gclient sync --with_branch_heads --with_tags"
-      & gclient sync --with_branch_heads --with_tags
-      if ($LASTEXITCODE -ne 0) { throw "gclient sync failed: $LASTEXITCODE" }
-    }
+
+    Write-Info ("gclient {0}" -f ($syncArgs -join ' '))
+    & gclient @syncArgs
+    if ($LASTEXITCODE -ne 0) { throw "gclient sync failed: $LASTEXITCODE" }
+    Write-Info "gclient sync finished"
   } finally {
     Pop-Location
   }
@@ -144,7 +190,6 @@ function Ensure-ChromiumCheckout {
 function Invoke-ChromiumBuild {
   Push-Location $Src
   try {
-    # Disk-tight official-ish args: no symbols/pdb, arm64 native
     $argsGn = @(
       'is_debug=false',
       'is_official_build=true',
@@ -155,15 +200,31 @@ function Invoke-ChromiumBuild {
       'target_cpu="arm64"'
     ) -join ' '
     Write-Info "gn gen out\Default --args=$argsGn"
+    Show-Disk
     & gn gen out\Default --args=$argsGn
     if ($LASTEXITCODE -ne 0) { throw "gn gen failed: $LASTEXITCODE" }
+    Write-Info "gn gen finished"
 
-    Write-Info "autoninja -C out\Default chrome"
-    & autoninja -C out\Default chrome
-    if ($LASTEXITCODE -ne 0) { throw "autoninja failed: $LASTEXITCODE" }
+    Write-Info "autoninja -C out\Default chrome (long; heartbeat every 10m)"
+    $heartbeat = Start-Job -ScriptBlock {
+      while ($true) {
+        Start-Sleep -Seconds 600
+        Write-Output ("[HEARTBEAT] {0} autoninja still running" -f (Get-Date -Format 'o'))
+      }
+    }
+    try {
+      & autoninja -C out\Default chrome
+      $ninjaExit = $LASTEXITCODE
+    } finally {
+      Stop-Job $heartbeat -ErrorAction SilentlyContinue
+      Receive-Job $heartbeat -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+      Remove-Job $heartbeat -Force -ErrorAction SilentlyContinue
+    }
+    if ($ninjaExit -ne 0) { throw "autoninja failed: $ninjaExit" }
+    Write-Info "autoninja finished"
 
     if ($Aggressive -eq '1') {
-      Write-Info "Mid-build cleanup: obj/gen/pdb under out\Default"
+      Write-Info "Post-link cleanup: obj/gen/pdb under out\Default"
       @(
         'out\Default\obj',
         'out\Default\gen',
