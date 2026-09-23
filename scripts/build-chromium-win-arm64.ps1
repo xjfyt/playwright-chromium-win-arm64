@@ -231,18 +231,29 @@ function Ensure-ChromiumCheckout {
 function Invoke-ChromiumBuild {
   Push-Location $Src
   try {
-    $argsGn = @(
-      'is_debug=false',
-      'is_official_build=true',
-      'is_component_build=false',
-      'symbol_level=0',
-      'blink_symbol_level=0',
-      'enable_nacl=false',
-      'target_cpu="arm64"'
-    ) -join ' '
-    Write-Info "gn gen out\Default --args=$argsGn"
+    # Do NOT pass --args=... via PowerShell Call operator: it strips the quotes
+    # around target_cpu="arm64", so gn sees bare arm64 (Undefined identifier).
+    # Failed run 35866577988 after ~3h sync. Write out/Default/args.gn instead
+    # (matches docs/BUILD.md intent; immune to PS quoting).
+    $outDir = 'out\Default'
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    $argsGnLines = @(
+      'is_debug = false',
+      'is_official_build = true',
+      'is_component_build = false',
+      'symbol_level = 0',
+      'blink_symbol_level = 0',
+      'enable_nacl = false',
+      'target_cpu = "arm64"',
+      # Hosted CI has no Chrome PGO profiles; official builds need this or link fails later.
+      'chrome_pgo_phase = 0'
+    )
+    $argsFile = Join-Path $outDir 'args.gn'
+    Set-Content -Path $argsFile -Value ($argsGnLines -join "`n") -Encoding ascii
+    Write-Info "Wrote $argsFile for gn gen:"
+    Get-Content $argsFile | ForEach-Object { Write-Info ("  {0}" -f $_) }
     Show-Disk
-    & gn gen out\Default --args=$argsGn
+    & gn gen $outDir
     if ($LASTEXITCODE -ne 0) { throw "gn gen failed: $LASTEXITCODE" }
     Write-Info "gn gen finished"
 

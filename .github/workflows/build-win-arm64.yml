@@ -175,7 +175,44 @@ jobs:
           }
 
       - name: Restore depot_tools + gclient cache
+        id: cache_restore
         uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/depot_tools
+            ${{ runner.temp }}/gclient-cache
+          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
+            ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
+            ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
+
+      # Run 35866577988: actions/cache reported hit then Azure auth failed mid-download;
+      # step still exited 0 with empty dirs — verify on disk before trusting cache-hit.
+      - name: Verify cache restore on disk
+        id: cache_ok
+        shell: pwsh
+        run: |
+          $dt = Join-Path $env:RUNNER_TEMP 'depot_tools'
+          $gc = Join-Path $env:RUNNER_TEMP 'gclient-cache'
+          $hasDt = (Test-Path (Join-Path $dt 'gclient.bat')) -or (Test-Path (Join-Path $dt 'gclient'))
+          $n = 0
+          if (Test-Path $gc) {
+            $n = @(Get-ChildItem $gc -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 20).Count
+          }
+          Write-Host "depot_tools=$hasDt gclient-cache-sample-files=$n"
+          if ($hasDt -and $n -gt 0) {
+            'present=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            'present=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Warning 'Cache restore left empty dirs (or miss). Will retry once.'
+          }
+
+      - name: Retry restore depot_tools + gclient cache
+        if: ${{ steps.cache_ok.outputs.present != 'true' }}
+        uses: actions/cache/restore@v4
+        continue-on-error: true
         with:
           path: |
             ${{ runner.temp }}/depot_tools
