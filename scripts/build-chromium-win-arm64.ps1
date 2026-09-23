@@ -69,7 +69,8 @@ function Ensure-DepotTools {
     Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache"
   }
   Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0"
-  & gclient --version 2>$null | Out-Host
+  Write-Info "depot_tools ready (gclient on PATH)"
+  & gclient help 2>$null | Select-Object -First 1 | Out-Host
 }
 
 function Reclaim-AfterSync {
@@ -112,10 +113,13 @@ function Ensure-ChromiumCheckout {
   New-Item -ItemType Directory -Force -Path $ChromiumRoot | Out-Null
   Show-Disk
 
+  # fetch uses --git-cache (boolean); path comes from GIT_CACHE_PATH / GCLIENT_CACHE_DIR.
+  # Do NOT pass --cache-dir to fetch.py — that flag does not exist (failed run 35678800862).
   $fetchArgs = @('--nohooks', 'chromium')
   $syncArgs = @('sync', '--with_branch_heads', '--with_tags')
   if ($GclientCache) {
-    $fetchArgs = @('--nohooks', '--cache-dir', $GclientCache, 'chromium')
+    $env:GIT_CACHE_PATH = $GclientCache
+    $fetchArgs = @('--nohooks', '--git-cache', 'chromium')
     $syncArgs = @('sync', '--with_branch_heads', '--with_tags', '--cache-dir', $GclientCache)
   }
 
