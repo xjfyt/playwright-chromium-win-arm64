@@ -144,6 +144,9 @@ function Ensure-ChromiumCheckout {
 
   # fetch uses --git-cache (boolean); path comes from GIT_CACHE_PATH / GCLIENT_CACHE_DIR.
   # Do NOT pass --cache-dir to fetch.py — that flag does not exist (failed run 35678800862).
+  # Do NOT pass --cache-dir to gclient sync either — current depot_tools rejects it
+  # (failed run 35841948132: "gclient.py: error: no such option: --cache-dir").
+  # Cache path for sync comes from GIT_CACHE_PATH + .gclient cache_dir (Repair-*).
   # Keep cache path forward-slash so fetch's .gclient cache_dir survives Python exec
   # (C:\a\_temp would become BEL — failed run 35828856871).
   $fetchArgs = @('--nohooks', 'chromium')
@@ -152,7 +155,7 @@ function Ensure-ChromiumCheckout {
     $GclientCache = ConvertTo-PySafeWinPath $GclientCache
     $env:GIT_CACHE_PATH = $GclientCache
     $fetchArgs = @('--nohooks', '--git-cache', 'chromium')
-    $syncArgs = @('sync', '--with_branch_heads', '--with_tags', '--cache-dir', $GclientCache)
+    # syncArgs stay without --cache-dir; GIT_CACHE_PATH + .gclient drive the cache.
   }
 
   if ($env:SKIP_FETCH -eq '1' -and (Test-Path $Src)) {
