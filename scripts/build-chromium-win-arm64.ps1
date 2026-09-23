@@ -32,7 +32,7 @@ function Default-Scratch([string]$name) {
 $DepotTools = if ($env:DEPOT_TOOLS) { $env:DEPOT_TOOLS } else { Default-Scratch 'depot_tools' }
 $ChromiumRoot = if ($env:CHROMIUM_ROOT) { $env:CHROMIUM_ROOT } else { Default-Scratch 'chromium' }
 $Src = Join-Path $ChromiumRoot 'src'
-$GclientCache = if ($env:GCLIENT_CACHE_DIR) { $env:GCLIENT_CACHE_DIR } else { $null }
+$GclientCache = if ($env:GCLIENT_CACHE_DIR) { ($env:GCLIENT_CACHE_DIR -replace '\\', '/') } else { $null }
 $Aggressive = if ($null -ne $env:AGGRESSIVE_DISK -and $env:AGGRESSIVE_DISK -ne '') { $env:AGGRESSIVE_DISK } else { if ($env:GITHUB_ACTIONS) { '1' } else { '0' } }
 
 function Write-Info([string]$msg) { Write-Host ("[INFO] {0} {1}" -f (Get-Date -Format 'o'), $msg) }
@@ -51,6 +51,34 @@ function Assert-Arm64Host {
   }
 }
 
+# GitHub Actions runner.temp is often C:\a\_temp. fetch.py writes cache_dir into
+# .gclient via "%s" % path (no escape). Python exec then turns \a into BEL (\x07),
+# so Windows treats "C:<BEL>\_temp\..." as a *drive-relative* path under cwd
+# (ChromiumRoot) and makedirs fails with WinError 123 on ...\chromium\<BEL>.
+# Forward slashes are accepted by Win32 and are safe inside Python string literals.
+function ConvertTo-PySafeWinPath([string]$p) {
+  if (-not $p) { return $p }
+  return ($p -replace '\\', '/')
+}
+
+function Repair-GclientCacheDirSpec {
+  # Belt-and-suspenders: rewrite cache_dir in .gclient to forward slashes if present.
+  $gclientFile = Join-Path $ChromiumRoot '.gclient'
+  if (-not (Test-Path $gclientFile)) { return }
+  if (-not $GclientCache) { return }
+  $safe = ConvertTo-PySafeWinPath $GclientCache
+  $raw = Get-Content -Raw -Path $gclientFile
+  $patched = [regex]::Replace(
+    $raw,
+    'cache_dir\s*=\s*"[^"]*"',
+    ('cache_dir = "{0}"' -f $safe)
+  )
+  if ($patched -ne $raw) {
+    Set-Content -Path $gclientFile -Value $patched -NoNewline
+    Write-Info "Rewrote .gclient cache_dir to py-safe path: $safe"
+  }
+}
+
 function Ensure-DepotTools {
   Write-Info "DEPOT_TOOLS=$DepotTools"
   if (-not (Test-Path (Join-Path $DepotTools 'gclient.bat')) -and -not (Test-Path (Join-Path $DepotTools 'gclient'))) {
@@ -64,9 +92,10 @@ function Ensure-DepotTools {
   $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
   $env:GCLIENT_PY3 = '1'
   if ($GclientCache) {
+    $GclientCache = ConvertTo-PySafeWinPath $GclientCache
     New-Item -ItemType Directory -Force -Path $GclientCache | Out-Null
     $env:GIT_CACHE_PATH = $GclientCache
-    Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache"
+    Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache (forward-slash for .gclient)"
   }
   Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0"
   Write-Info "depot_tools ready (gclient on PATH)"
@@ -115,9 +144,12 @@ function Ensure-ChromiumCheckout {
 
   # fetch uses --git-cache (boolean); path comes from GIT_CACHE_PATH / GCLIENT_CACHE_DIR.
   # Do NOT pass --cache-dir to fetch.py — that flag does not exist (failed run 35678800862).
+  # Keep cache path forward-slash so fetch's .gclient cache_dir survives Python exec
+  # (C:\a\_temp would become BEL — failed run 35828856871).
   $fetchArgs = @('--nohooks', 'chromium')
   $syncArgs = @('sync', '--with_branch_heads', '--with_tags')
   if ($GclientCache) {
+    $GclientCache = ConvertTo-PySafeWinPath $GclientCache
     $env:GIT_CACHE_PATH = $GclientCache
     $fetchArgs = @('--nohooks', '--git-cache', 'chromium')
     $syncArgs = @('sync', '--with_branch_heads', '--with_tags', '--cache-dir', $GclientCache)
@@ -160,6 +192,8 @@ function Ensure-ChromiumCheckout {
     Reclaim-AfterSync
     return
   }
+
+  Repair-GclientCacheDirSpec
 
   Push-Location $Src
   try {

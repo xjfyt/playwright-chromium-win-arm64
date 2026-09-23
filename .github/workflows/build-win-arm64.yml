@@ -46,7 +46,7 @@ env:
   RELEASE_TAG: "v1.62.1234-cn.1"
   PACKAGE_STEM: "playwright-chromium-windows-aarch64-1.62.1234+cn.1"
   # Cache key fragment — bump if cache layout changes
-  CACHE_SCHEMA: "v1"
+  CACHE_SCHEMA: "v2"
 
 jobs:
   probe:
@@ -118,9 +118,9 @@ jobs:
           # Keep .git during sync-warm so cache-dir benefits; reclaim still drops bulky trees.
           DELETE_GIT_AFTER_SYNC: '0'
           SKIP_BUILD: '1'
-          DEPOT_TOOLS: ${{ runner.temp }}\depot_tools
-          CHROMIUM_ROOT: ${{ runner.temp }}\chromium
-          GCLIENT_CACHE_DIR: ${{ runner.temp }}\gclient-cache
+          DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
+          CHROMIUM_ROOT: ${{ runner.temp }}/chromium
+          GCLIENT_CACHE_DIR: ${{ runner.temp }}/gclient-cache
         run: |
           .\scripts\build-chromium-win-arm64.ps1
 
@@ -192,16 +192,16 @@ jobs:
           DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
           AGGRESSIVE_DISK: '1'
           DELETE_GIT_AFTER_SYNC: ${{ inputs.delete_git_after_sync && '1' || '0' }}
-          DEPOT_TOOLS: ${{ runner.temp }}\depot_tools
-          CHROMIUM_ROOT: ${{ runner.temp }}\chromium
-          GCLIENT_CACHE_DIR: ${{ runner.temp }}\gclient-cache
+          DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
+          CHROMIUM_ROOT: ${{ runner.temp }}/chromium
+          GCLIENT_CACHE_DIR: ${{ runner.temp }}/gclient-cache
         run: |
           .\scripts\build-chromium-win-arm64.ps1
 
       - name: Pack Playwright layout
         shell: pwsh
         env:
-          CHROMIUM_ROOT: ${{ runner.temp }}\chromium
+          CHROMIUM_ROOT: ${{ runner.temp }}/chromium
         run: |
           $from = Join-Path $env:CHROMIUM_ROOT 'src\out\Default'
           if (-not (Test-Path $from)) { throw "Missing $from" }
