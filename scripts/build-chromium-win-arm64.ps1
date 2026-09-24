@@ -61,6 +61,21 @@ function ConvertTo-PySafeWinPath([string]$p) {
   return ($p -replace '\\', '/')
 }
 
+# GitHub-hosted runners reach gs://chromium-git-cache at ~1-2 KiB/s (run 35940687183
+# burned ~2h51m on gsutil and never finished fetch). Only enable --git-cache /
+# GIT_CACHE_PATH when Actions restore already left real pack files on disk.
+function Test-GclientCacheWarm {
+  if (-not $GclientCache) { return $false }
+  if (-not (Test-Path $GclientCache)) { return $false }
+  $packs = @(Get-ChildItem -Path $GclientCache -Recurse -Filter '*.pack' -ErrorAction SilentlyContinue | Select-Object -First 3)
+  if ($packs.Count -ge 1) {
+    Write-Info ("gclient-cache WARM: found {0} pack sample(s) under {1}" -f $packs.Count, $GclientCache)
+    return $true
+  }
+  Write-Warn "gclient-cache COLD (no *.pack under $GclientCache) — will fetch WITHOUT --git-cache / GCS mirror"
+  return $false
+}
+
 function Repair-GclientCacheDirSpec {
   # Belt-and-suspenders: rewrite cache_dir in .gclient to forward slashes if present.
   $gclientFile = Join-Path $ChromiumRoot '.gclient'
@@ -101,11 +116,12 @@ function Ensure-DepotTools {
   $env:Path = "$DepotTools;" + $env:Path
   $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
   $env:GCLIENT_PY3 = '1'
+  # Defer GIT_CACHE_PATH until Ensure-ChromiumCheckout decides warm vs cold.
+  # Setting it here would make a cold fetch pull gs://chromium-git-cache via gsutil.
   if ($GclientCache) {
     $GclientCache = ConvertTo-PySafeWinPath $GclientCache
     New-Item -ItemType Directory -Force -Path $GclientCache | Out-Null
-    $env:GIT_CACHE_PATH = $GclientCache
-    Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache (forward-slash for .gclient)"
+    Write-Info "GCLIENT_CACHE_DIR=$GclientCache (GIT_CACHE_PATH deferred until warm/cold check)"
   }
 
   $pyRel = Join-Path $DepotTools 'python3_bin_reldir.txt'
@@ -182,20 +198,28 @@ function Ensure-ChromiumCheckout {
   New-Item -ItemType Directory -Force -Path $ChromiumRoot | Out-Null
   Show-Disk
 
-  # fetch uses --git-cache (boolean); path comes from GIT_CACHE_PATH / GCLIENT_CACHE_DIR.
-  # Do NOT pass --cache-dir to fetch.py — that flag does not exist (failed run 35678800862).
-  # Do NOT pass --cache-dir to gclient sync either — current depot_tools rejects it
-  # (failed run 35841948132: "gclient.py: error: no such option: --cache-dir").
-  # Cache path for sync comes from GIT_CACHE_PATH + .gclient cache_dir (Repair-*).
-  # Keep cache path forward-slash so fetch's .gclient cache_dir survives Python exec
-  # (C:\a\_temp would become BEL — failed run 35828856871).
-  $fetchArgs = @('--nohooks', 'chromium')
+  # fetch: --git-cache is boolean; path from GIT_CACHE_PATH. Do NOT pass --cache-dir
+  # to fetch.py (35678800862) or gclient sync (35841948132). Forward-slash paths
+  # avoid BEL from C:\a\_temp (35828856871).
+  #
+  # CRITICAL (35940687183): COLD --git-cache populates from gs://chromium-git-cache
+  # via gsutil at ~1-2 KiB/s on GitHub-hosted Windows ARM and burns the 6h budget.
+  # Only enable git-cache when Actions restore already left *.pack (warm).
+  # Cold path: plain `fetch --nohooks chromium` from googlesource (no GCS mirror).
   $syncArgs = @('sync', '--with_branch_heads', '--with_tags')
-  if ($GclientCache) {
+  $cacheWarm = Test-GclientCacheWarm
+  if ($cacheWarm) {
     $GclientCache = ConvertTo-PySafeWinPath $GclientCache
     $env:GIT_CACHE_PATH = $GclientCache
     $fetchArgs = @('--nohooks', '--git-cache', 'chromium')
-    # syncArgs stay without --cache-dir; GIT_CACHE_PATH + .gclient drive the cache.
+    Write-Info "Using WARM git-cache: GIT_CACHE_PATH=$GclientCache"
+  } else {
+    Remove-Item Env:\GIT_CACHE_PATH -ErrorAction SilentlyContinue
+    # Avoid writing cache_dir into .gclient on cold path (would re-trigger GCS populate).
+    $script:GclientCache = $null
+    $GclientCache = $null
+    $fetchArgs = @('--nohooks', 'chromium')
+    Write-Info 'Using COLD fetch (no --git-cache, no GIT_CACHE_PATH)'
   }
 
   if ($env:SKIP_FETCH -eq '1' -and (Test-Path $Src)) {

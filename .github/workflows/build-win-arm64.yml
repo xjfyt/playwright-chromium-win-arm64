@@ -5,7 +5,9 @@
 # restorable in Build (run 35921596181), so Build cold-started and wasted the 6h budget.
 #
 # Full Chromium src (~50GB+) still cannot fit in Actions cache. We only cache depot_tools +
-# gclient object cache to speed the *next* run's sync. timeout-minutes >360 does NOT raise the cap.
+# gclient object cache to speed the *next* run's sync when *.pack files are present (warm).
+# Cold runs must NOT use --git-cache (GCS mirror is ~1-2 KiB/s on hosted ARM; run 35940687183).
+# timeout-minutes >360 does NOT raise the hosted 6h cap.
 #
 # Runner: prefer windows-11-vs2026-arm; AtlasGraph reference windows-11-arm.
 # Do not silently switch labels on disk failure.
@@ -41,8 +43,10 @@ env:
   CHROME_TAG: "151.0.7922.34"
   RELEASE_TAG: "v1.62.1234-cn.1"
   PACKAGE_STEM: "playwright-chromium-windows-aarch64-1.62.1234+cn.1"
-  # Bump when cache layout / key strategy changes (v4: require bootstrapped depot_tools; invalidate incomplete v3 from run 35939021520)
-  CACHE_SCHEMA: "v4"
+  # Bump when cache layout / key strategy changes
+  # v5: cold fetch skips GCS git-cache (run 35940687183); warm = depot_tools bootstrapped + *.pack in gclient-cache
+  # v4: require bootstrapped depot_tools; invalidate incomplete v3 from run 35939021520
+  CACHE_SCHEMA: "v5"
 
 jobs:
   probe:
@@ -140,17 +144,19 @@ jobs:
           $hasDt = (Test-Path (Join-Path $dt 'gclient.bat')) -or (Test-Path (Join-Path $dt 'gclient'))
           $bootstrapped = Test-Path (Join-Path $dt 'python3_bin_reldir.txt')
           $n = 0
+          $packs = 0
           if (Test-Path $gc) {
             $n = @(Get-ChildItem $gc -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 20).Count
+            $packs = @(Get-ChildItem $gc -Recurse -Filter '*.pack' -ErrorAction SilentlyContinue | Select-Object -First 3).Count
           }
-          Write-Host "depot_tools=$hasDt bootstrapped=$bootstrapped gclient-cache-sample-files=$n"
+          Write-Host "depot_tools=$hasDt bootstrapped=$bootstrapped gclient-cache-sample-files=$n pack-samples=$packs"
           # Incomplete cache (clone only, no CIPD/python bootstrap) looks "present" but fetch fails
-          # (run 35939021520). Treat unbootstrapped depot_tools as a miss.
-          if ($hasDt -and $bootstrapped -and $n -gt 0) {
+          # (run 35939021520). Partial gsutil populate without *.pack is also a miss (run 35940687183).
+          if ($hasDt -and $bootstrapped -and $packs -gt 0) {
             'present=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
             'present=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Warning 'Cache restore empty, miss, or unbootstrapped depot_tools; will cold-sync (budget risk under 6h).'
+            Write-Warning 'Cache restore empty/miss/unbootstrapped/no-packs; cold fetch WITHOUT GCS git-cache.'
           }
 
       - name: Retry restore depot_tools + gclient cache
