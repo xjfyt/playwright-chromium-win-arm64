@@ -14,7 +14,10 @@
     SKIP_FETCH    - "1" to skip fetch/sync when checkout exists
     SKIP_BUILD    - "1" to skip gn/autoninja
     AGGRESSIVE_DISK - "1" (default on CI) reclaim disk after sync / mid-build
-    DELETE_GIT_AFTER_SYNC - "1" remove src\.git after sync (skip slow git gc)
+    DELETE_GIT_AFTER_SYNC - "1" remove src\.git after sync (skip slow git gc).
+                         Before the delete, set generate_location_tags=false in
+                         src\build\config\gclient_args.gni so gn gen does not
+                         depend on histograms_xml (defined only if // .git exists).
 
   Does NOT pack; run scripts/pack-playwright-layout.mjs afterwards.
 #>
@@ -158,6 +161,34 @@ function Ensure-DepotTools {
   & gclient --version 2>$null | Select-Object -First 3 | ForEach-Object { Write-Info $_ }
 }
 
+function Set-GclientArgsForNonGitCheckout {
+  # Tag 151.0.7922.34 tools/metrics/BUILD.gn:
+  #   histograms_xml is defined only inside path_exists("//.git")
+  #   metrics_metadata depends on it when generate_location_tags is true
+  # gclient hooks write generate_location_tags=true while .git still exists.
+  # Deleting src\.git before gn gen then fails with unresolved histograms_xml
+  # (run 35953615443). Non-git trees must use false (also clears the default
+  # tests_have_location_tags = generate_location_tags in testing/test.gni).
+  $gni = Join-Path $Src 'build\config\gclient_args.gni'
+  if (-not (Test-Path -LiteralPath $gni)) {
+    throw "Missing $gni — cannot set generate_location_tags=false for a non-git tree (gn gen would need histograms_xml)."
+  }
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  $raw = [System.IO.File]::ReadAllText($gni)
+  $truePattern = '(?im)^([ \t]*)generate_location_tags[ \t]*=[ \t]*true[ \t]*\r?$'
+  $falsePattern = '(?im)^[ \t]*generate_location_tags[ \t]*=[ \t]*false[ \t]*\r?$'
+  $patched = [regex]::Replace($raw, $truePattern, '${1}generate_location_tags = false')
+  if ($patched -eq $raw) {
+    if ([regex]::IsMatch($raw, $falsePattern)) {
+      Write-Info "build/config/gclient_args.gni already has generate_location_tags = false"
+      return
+    }
+    throw "build/config/gclient_args.gni has no generate_location_tags assignment. Refusing to gn-gen without src\.git (metrics_metadata -> histograms_xml)."
+  }
+  [System.IO.File]::WriteAllText($gni, $patched, $utf8NoBom)
+  Write-Info "Patched build/config/gclient_args.gni: generate_location_tags = false (non-git checkout)"
+}
+
 function Reclaim-AfterSync {
   if ($Aggressive -ne '1') { return }
   Write-Info "Disk reclaim after sync (start)"
@@ -168,7 +199,9 @@ function Reclaim-AfterSync {
       if ($env:DELETE_GIT_AFTER_SYNC -eq '1') {
         # CRITICAL: do NOT run git gc --aggressive first — it can take many hours on
         # a full Chromium tree and burned the remaining wall clock on run 35622650851.
-        Write-Warn "DELETE_GIT_AFTER_SYNC=1 — removing src\.git immediately (skip git gc)"
+        # Patch gclient_args BEFORE removing .git so gn gen stays consistent.
+        Write-Warn "DELETE_GIT_AFTER_SYNC=1 — generate_location_tags=false, then remove src\.git (skip git gc)"
+        Set-GclientArgsForNonGitCheckout
         Remove-Item -Recurse -Force '.git'
         Write-Info "src\.git removed"
       } else {
@@ -295,6 +328,14 @@ function Ensure-ChromiumCheckout {
 function Invoke-ChromiumBuild {
   Push-Location $Src
   try {
+    # Safety net if .git was removed (DELETE_GIT_AFTER_SYNC, or a resumed tree)
+    # and gclient_args.gni is still the post-hook true value. Also covers a
+    # later `gn gen` from autoninja: the patched file stays false.
+    if (-not (Test-Path -LiteralPath '.git')) {
+      Write-Info "src\.git absent — ensuring generate_location_tags=false before gn gen"
+      Set-GclientArgsForNonGitCheckout
+    }
+
     # Do NOT pass --args=... via PowerShell Call operator: it strips the quotes
     # around target_cpu="arm64", so gn sees bare arm64 (Undefined identifier).
     # Failed run 35866577988 after ~3h sync. Write out/Default/args.gn instead

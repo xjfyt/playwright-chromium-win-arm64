@@ -19,6 +19,7 @@ GitHub-hosted jobs stop at **6 hours**. Do not set `timeout-minutes: 720` expect
 - Workflow: `probe` → `sync` (SKIP_BUILD, warm `GCLIENT_CACHE_DIR`) → `build` (restore cache, compile, pack, release).
 - Actions cache holds **depot_tools + gclient object cache** only. Full `src/` is too large for cache/artifacts.
 - Env: `GCLIENT_CACHE_DIR` / `GIT_CACHE_PATH`; `DELETE_GIT_AFTER_SYNC=1` removes `.git` **without** `git gc --aggressive`.
+- Before that delete (and again before `gn gen` if `src\.git` is already gone), the script sets `generate_location_tags = false` in `src/build/config/gclient_args.gni`. On tag 151.0.7922.34, `//tools/metrics:histograms_xml` exists only when `//.git` is present, but `metrics_metadata` still depends on it while the flag is true (gclient hooks). Leaving the flag true after the delete makes `gn gen` fail with unresolved dependencies (run 35953615443). `tests_have_location_tags` defaults to the same flag. LLVM/Rust disk reclaim still runs after the delete.
 - Optional workflow input `skip_sync_job` skips the warm job (build still syncs).
 
 Automated: `scripts/build-chromium-win-arm64.ps1` (sections 2–4) then `scripts/pack-playwright-layout.mjs`.
@@ -160,4 +161,5 @@ The packer strips `pdb` / `obj` / `gen`, refuses Program Files Chrome/Edge, and 
 | Packer reports x64 | Wrong arch; do not rename x64 chrome-win64 |
 | Packer refuses Program Files | Expected; compile Chromium |
 | Disk full on hosted ARM | Keep `windows-11-arm` / `windows-11-vs2026-arm`; report logs; do not silently switch |
+| `gn gen`: `metrics_metadata` needs `histograms_xml` | `DELETE_GIT_AFTER_SYNC` must set `generate_location_tags = false` in `build/config/gclient_args.gni` **before** removing `src\.git` |
 | Playwright cannot find browser | Must be `chromium-1234/chrome-win64/`, not `chrome-win-arm64/` |
