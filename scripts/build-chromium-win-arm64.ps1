@@ -81,8 +81,10 @@ function Repair-GclientCacheDirSpec {
 
 function Ensure-DepotTools {
   Write-Info "DEPOT_TOOLS=$DepotTools"
-  # Disable auto-update: concurrent "Updating depot_tools..." from gclient/fetch races on
-  # .git/index.lock (failed run 35921596181 right after cold clone).
+  # Keep UPDATE=0 for day-to-day gclient/fetch to avoid .git/index.lock races
+  # (failed run 35921596181). But a fresh clone (or incomplete Actions cache) has no
+  # python3_bin_reldir.txt until bootstrap — with UPDATE=0, fetch dies immediately
+  # (failed run 35939021520: "python3_bin_reldir.txt not found").
   $env:DEPOT_TOOLS_UPDATE = '0'
   if (-not (Test-Path (Join-Path $DepotTools 'gclient.bat')) -and -not (Test-Path (Join-Path $DepotTools 'gclient'))) {
     Write-Info "Cloning depot_tools..."
@@ -105,9 +107,39 @@ function Ensure-DepotTools {
     $env:GIT_CACHE_PATH = $GclientCache
     Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache (forward-slash for .gclient)"
   }
+
+  $pyRel = Join-Path $DepotTools 'python3_bin_reldir.txt'
+  if (-not (Test-Path $pyRel)) {
+    Write-Info "Bootstrapping depot_tools once (python3_bin_reldir.txt missing; UPDATE briefly enabled)..."
+    Remove-Item Env:\DEPOT_TOOLS_UPDATE -ErrorAction SilentlyContinue
+    $updBat = Join-Path $DepotTools 'update_depot_tools.bat'
+    if (Test-Path $updBat) {
+      & cmd.exe /c "`"$updBat`""
+      $bootExit = $LASTEXITCODE
+      Write-Info "update_depot_tools.bat exit=$bootExit"
+    } else {
+      Write-Warn "update_depot_tools.bat missing; trying gclient --version to trigger bootstrap"
+      & gclient --version
+      $bootExit = $LASTEXITCODE
+    }
+    $env:DEPOT_TOOLS_UPDATE = '0'
+    $lock2 = Join-Path $DepotTools '.git\index.lock'
+    if (Test-Path $lock2) {
+      Write-Warn "Removing depot_tools .git/index.lock after bootstrap"
+      Remove-Item -Force $lock2 -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path $pyRel)) {
+      throw "depot_tools bootstrap failed: python3_bin_reldir.txt still missing (bootExit=$bootExit)"
+    }
+    $pyRelTxt = (Get-Content -Raw $pyRel).Trim()
+    Write-Info "depot_tools bootstrap OK: $pyRelTxt"
+  } else {
+    Write-Info "depot_tools already bootstrapped (python3_bin_reldir.txt present)"
+  }
+
   Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0 DEPOT_TOOLS_UPDATE=0"
   Write-Info "depot_tools ready (gclient on PATH)"
-  & gclient help 2>$null | Select-Object -First 1 | Out-Host
+  & gclient --version 2>$null | Select-Object -First 3 | ForEach-Object { Write-Info $_ }
 }
 
 function Reclaim-AfterSync {

@@ -41,8 +41,8 @@ env:
   CHROME_TAG: "151.0.7922.34"
   RELEASE_TAG: "v1.62.1234-cn.1"
   PACKAGE_STEM: "playwright-chromium-windows-aarch64-1.62.1234+cn.1"
-  # Bump when cache layout / key strategy changes (v3: stable key, single-job pipeline)
-  CACHE_SCHEMA: "v3"
+  # Bump when cache layout / key strategy changes (v4: require bootstrapped depot_tools; invalidate incomplete v3 from run 35939021520)
+  CACHE_SCHEMA: "v4"
 
 jobs:
   probe:
@@ -109,7 +109,7 @@ jobs:
           }
 
       # Stable key (no run_id): next run can restore. Same-job handoff no longer needed.
-      # Prefer v3; fall back to v2 keys from prior multi-stage runs when present.
+      # Prefer v4; fall back to v3/v2 keys. Verify step rejects unbootstrapped depot_tools.
       - name: Restore depot_tools + gclient cache
         id: cache_restore
         uses: actions/cache/restore@v4
@@ -123,6 +123,9 @@ jobs:
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-
@@ -135,16 +138,19 @@ jobs:
           $dt = Join-Path $env:RUNNER_TEMP 'depot_tools'
           $gc = Join-Path $env:RUNNER_TEMP 'gclient-cache'
           $hasDt = (Test-Path (Join-Path $dt 'gclient.bat')) -or (Test-Path (Join-Path $dt 'gclient'))
+          $bootstrapped = Test-Path (Join-Path $dt 'python3_bin_reldir.txt')
           $n = 0
           if (Test-Path $gc) {
             $n = @(Get-ChildItem $gc -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 20).Count
           }
-          Write-Host "depot_tools=$hasDt gclient-cache-sample-files=$n"
-          if ($hasDt -and $n -gt 0) {
+          Write-Host "depot_tools=$hasDt bootstrapped=$bootstrapped gclient-cache-sample-files=$n"
+          # Incomplete cache (clone only, no CIPD/python bootstrap) looks "present" but fetch fails
+          # (run 35939021520). Treat unbootstrapped depot_tools as a miss.
+          if ($hasDt -and $bootstrapped -and $n -gt 0) {
             'present=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
             'present=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Warning 'Cache restore empty or miss; will cold-sync (budget risk under 6h).'
+            Write-Warning 'Cache restore empty, miss, or unbootstrapped depot_tools; will cold-sync (budget risk under 6h).'
           }
 
       - name: Retry restore depot_tools + gclient cache
@@ -160,6 +166,9 @@ jobs:
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
+            v3-winarm-gclient-${{ env.CHROME_TAG }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             v2-winarm-gclient-${{ env.CHROME_TAG }}-
