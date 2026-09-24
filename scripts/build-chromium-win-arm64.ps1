@@ -210,14 +210,25 @@ function Reclaim-AfterSync {
         git gc --prune=now 2>$null
       }
     }
-    @(
-      'third_party\llvm-build\Release+Asserts\lib',
-      'third_party\rust-toolchain\lib\rustlib\src'
-    ) | ForEach-Object {
-      if (Test-Path $_) {
-        Write-Info "Removing $_"
-        Remove-Item -Recurse -Force $_ -ErrorAction SilentlyContinue
-      }
+    # Do NOT delete third_party\llvm-build\Release+Asserts\lib.
+    # That tree holds clang runtime libs, not a disposable cache. With
+    # target_cpu=arm64, win_clang_x64_for_rust_host_build_tools links
+    # lib\clang\*\lib\windows\clang_rt.builtins-x86_64.lib (and the chrome
+    # link needs clang_rt.builtins-aarch64.lib plus the other windows
+    # clang_rt libs). Wiping the directory made autoninja fail immediately
+    # after gn gen (run 35967597337). Headers under lib\clang\*\include
+    # are also required to compile. Keep the whole lib tree.
+    $llvmLib = 'third_party\llvm-build\Release+Asserts\lib'
+    if (Test-Path -LiteralPath $llvmLib) {
+      Write-Info "Keeping $llvmLib (clang_rt builtins required for Rust host and ARM64 link)"
+    } else {
+      Write-Warn "Missing $llvmLib after sync; clang_rt.builtins-x86_64.lib will be absent"
+    }
+    # Rust standard-library sources. Not an input to the chrome / cxxbridge link.
+    $rustSrc = 'third_party\rust-toolchain\lib\rustlib\src'
+    if (Test-Path -LiteralPath $rustSrc) {
+      Write-Info "Removing $rustSrc"
+      Remove-Item -LiteralPath $rustSrc -Recurse -Force -ErrorAction SilentlyContinue
     }
   } finally {
     Pop-Location
@@ -325,6 +336,28 @@ function Ensure-ChromiumCheckout {
   Reclaim-AfterSync
 }
 
+function Assert-ClangRtBuiltinsForArm64 {
+  # Pre-autoninja: gn gen does not notice a missing compiler-rt archive.
+  # run 35967597337 only failed once ninja scheduled the Rust host lib.
+  $clangLib = Join-Path $Src 'third_party\llvm-build\Release+Asserts\lib\clang'
+  $x64 = $null
+  if (Test-Path -LiteralPath $clangLib) {
+    $x64 = Get-ChildItem -LiteralPath $clangLib -Recurse -Filter 'clang_rt.builtins-x86_64.lib' -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.Directory.Name -eq 'windows' } |
+      Select-Object -First 1
+  }
+  if (-not $x64) {
+    throw "Missing clang_rt.builtins-x86_64.lib under third_party\llvm-build\Release+Asserts\lib\clang\*\lib\windows. win_clang_x64_for_rust_host_build_tools needs it when target_cpu=arm64 (Rust host / cxxbridge). Disk reclaim must not delete Release+Asserts\lib. See run 35967597337."
+  }
+  Write-Info ("clang_rt.builtins-x86_64.lib present: {0} ({1:N1} MB)" -f $x64.FullName, ($x64.Length / 1MB))
+  $arm = Join-Path $x64.DirectoryName 'clang_rt.builtins-aarch64.lib'
+  if (Test-Path -LiteralPath $arm) {
+    Write-Info "clang_rt.builtins-aarch64.lib present: $arm"
+  } else {
+    Write-Warn "clang_rt.builtins-aarch64.lib missing beside x86_64 builtins; ARM64 chrome link may fail"
+  }
+}
+
 function Invoke-ChromiumBuild {
   Push-Location $Src
   try {
@@ -361,6 +394,7 @@ function Invoke-ChromiumBuild {
     & gn gen $outDir
     if ($LASTEXITCODE -ne 0) { throw "gn gen failed: $LASTEXITCODE" }
     Write-Info "gn gen finished"
+    Assert-ClangRtBuiltinsForArm64
 
     Write-Info "autoninja -C out\Default chrome (long; heartbeat every 10m)"
     $heartbeat = Start-Job -ScriptBlock {
