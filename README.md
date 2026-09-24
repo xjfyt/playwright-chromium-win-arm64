@@ -83,7 +83,7 @@ Chromium 通常需要 **≥100 GB** 空闲；托管 ARM 镜像往往远小于此
 - `DEPOT_TOOLS_WIN_TOOLCHAIN=0`
 - `is_official_build=true` / `symbol_level=0` / `blink_symbol_level=0`（避免 pdb）
 - sync 后可选删除 `src\.git`（`DELETE_GIT_AFTER_SYNC`）
-- 可删除 `third_party\rust-toolchain\lib\rustlib\src`；**不要**删除 `third_party\llvm-build\Release+Asserts\lib`（Rust host 需要 `clang_rt.builtins-x86_64.lib`）
+- **不要**删除 `third_party\rust-toolchain\lib\rustlib\src`（Rust host compiler-builtins 需要 `build.rs`）；**不要**删除 `third_party\llvm-build\Release+Asserts\lib`（Rust host 需要 `clang_rt.builtins-x86_64.lib`）
 - 编完清理 `out\Default\obj` / `gen` / `*.pdb`
 - 打包只保留运行时文件到 `chromium-1234/chrome-win64/`
 

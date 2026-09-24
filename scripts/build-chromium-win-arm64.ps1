@@ -224,11 +224,18 @@ function Reclaim-AfterSync {
     } else {
       Write-Warn "Missing $llvmLib after sync; clang_rt.builtins-x86_64.lib will be absent"
     }
-    # Rust standard-library sources. Not an input to the chrome / cxxbridge link.
+    # Do NOT delete third_party\rust-toolchain\lib\rustlib\src.
+    # Those are the Rust standard-library sources, not a disposable cache.
+    # With target_cpu=arm64, win_clang_x64_for_rust_host_build_tools compiles
+    # compiler-builtins from
+    # rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs.
+    # Deleting the tree made autoninja fail immediately after gn gen
+    # (run 35983981319) even though clang_rt.builtins-*.lib were present.
     $rustSrc = 'third_party\rust-toolchain\lib\rustlib\src'
     if (Test-Path -LiteralPath $rustSrc) {
-      Write-Info "Removing $rustSrc"
-      Remove-Item -LiteralPath $rustSrc -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Info "Keeping $rustSrc (compiler-builtins build.rs required for Rust host build tools)"
+    } else {
+      Write-Warn "Missing $rustSrc after sync; compiler-builtins build.rs will be absent"
     }
   } finally {
     Pop-Location
@@ -358,6 +365,26 @@ function Assert-ClangRtBuiltinsForArm64 {
   }
 }
 
+function Assert-CompilerBuiltinsBuildScript {
+  # Pre-autoninja: gn gen does not notice a missing Rust build.rs.
+  # run 35983981319 only failed once ninja scheduled the Rust host build script.
+  $rustSrc = Join-Path $Src 'third_party\rust-toolchain\lib\rustlib\src'
+  $expectedRel = 'rust\library\compiler-builtins\compiler-builtins\build.rs'
+  $expected = Join-Path $rustSrc $expectedRel
+  $found = $null
+  if (Test-Path -LiteralPath $expected) {
+    $found = Get-Item -LiteralPath $expected
+  } elseif (Test-Path -LiteralPath $rustSrc) {
+    $found = Get-ChildItem -LiteralPath $rustSrc -Recurse -Filter 'build.rs' -File -ErrorAction SilentlyContinue |
+      Where-Object { ($_.FullName -replace '\\', '/') -match '/compiler-builtins/compiler-builtins/build\.rs$' } |
+      Select-Object -First 1
+  }
+  if (-not $found) {
+    throw "Missing compiler-builtins build.rs under third_party\rust-toolchain\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs. win_clang_x64_for_rust_host_build_tools needs it when target_cpu=arm64. Disk reclaim must not delete rustlib\src. See run 35983981319."
+  }
+  Write-Info ("compiler-builtins build.rs present: {0}" -f $found.FullName)
+}
+
 function Invoke-ChromiumBuild {
   Push-Location $Src
   try {
@@ -395,6 +422,7 @@ function Invoke-ChromiumBuild {
     if ($LASTEXITCODE -ne 0) { throw "gn gen failed: $LASTEXITCODE" }
     Write-Info "gn gen finished"
     Assert-ClangRtBuiltinsForArm64
+    Assert-CompilerBuiltinsBuildScript
 
     Write-Info "autoninja -C out\Default chrome (long; heartbeat every 10m)"
     $heartbeat = Start-Job -ScriptBlock {
