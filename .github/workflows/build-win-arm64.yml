@@ -1,11 +1,11 @@
 # Build Playwright Chromium 1.62 rev1234 (151.0.7922.34) for Windows ARM64.
 #
-# Multi-stage (hosted 6h hard cap per job):
-#   probe → sync (warm gclient/git cache) → build (restore cache, compile, pack, release)
+# Single Windows job (hosted 6h hard cap): restore cache → sync → compile → pack → release → save cache.
+# Split sync/build was abandoned: Actions cache of gclient (~20–25GB) saved in Sync was not
+# restorable in Build (run 35921596181), so Build cold-started and wasted the 6h budget.
 #
-# Full Chromium src (~50GB+) cannot fit in Actions cache/artifacts (~10GB). We only
-# cache depot_tools + gclient object cache to speed the next sync so more of the
-# 6h budget goes to autoninja. timeout-minutes >360 does NOT raise the hosted cap.
+# Full Chromium src (~50GB+) still cannot fit in Actions cache. We only cache depot_tools +
+# gclient object cache to speed the *next* run's sync. timeout-minutes >360 does NOT raise the cap.
 #
 # Runner: prefer windows-11-vs2026-arm; AtlasGraph reference windows-11-arm.
 # Do not silently switch labels on disk failure.
@@ -29,10 +29,6 @@ on:
         description: "Upload GitHub Release v1.62.1234-cn.1"
         type: boolean
         default: true
-      skip_sync_job:
-        description: "Skip sync job; build job still syncs (uses existing Actions cache if any)"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -45,8 +41,8 @@ env:
   CHROME_TAG: "151.0.7922.34"
   RELEASE_TAG: "v1.62.1234-cn.1"
   PACKAGE_STEM: "playwright-chromium-windows-aarch64-1.62.1234+cn.1"
-  # Cache key fragment — bump if cache layout changes
-  CACHE_SCHEMA: "v2"
+  # Bump when cache layout / key strategy changes (v3: stable key, single-job pipeline)
+  CACHE_SCHEMA: "v3"
 
 jobs:
   probe:
@@ -78,73 +74,11 @@ jobs:
             echo "::warning::At least one public win-arm64 zip returned 200. Self-build may be unnecessary; continuing build job anyway (soft)."
           fi
 
-  sync:
-    name: Sync + warm gclient cache
+  build:
+    name: Sync + build + pack on Windows ARM
     needs: probe
-    if: ${{ !inputs.skip_sync_job }}
     runs-on: ${{ inputs.runner }}
     # Hosted Windows jobs hard-cap at 6h regardless of a higher timeout-minutes.
-    timeout-minutes: 360
-    steps:
-      - name: Disk / arch preflight
-        shell: pwsh
-        run: |
-          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
-          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw "Expected ARM64 runner" }
-          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}
-          $free = (Get-PSDrive C).Free
-          if ($free -lt 20GB) {
-            Write-Warning "Low free disk on C: $([math]::Round($free/1GB,1)) GB. Chromium typically needs >=100GB free; this hosted image may fail. Do not switch labels silently — report disk failure."
-          }
-
-      - uses: actions/checkout@v4
-
-      - name: Restore depot_tools + gclient cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ runner.temp }}/depot_tools
-            ${{ runner.temp }}/gclient-cache
-          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}
-          restore-keys: |
-            ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
-            ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
-
-      - name: Sync Chromium (no compile)
-        shell: pwsh
-        env:
-          DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
-          AGGRESSIVE_DISK: '1'
-          # Keep .git during sync-warm so cache-dir benefits; reclaim still drops bulky trees.
-          DELETE_GIT_AFTER_SYNC: '0'
-          SKIP_BUILD: '1'
-          DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
-          CHROMIUM_ROOT: ${{ runner.temp }}/chromium
-          GCLIENT_CACHE_DIR: ${{ runner.temp }}/gclient-cache
-        run: |
-          .\scripts\build-chromium-win-arm64.ps1
-
-      - name: Save depot_tools + gclient cache
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ runner.temp }}/depot_tools
-            ${{ runner.temp }}/gclient-cache
-          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-${{ github.run_id }}
-        # If cache >~10GB, save fails; build job still runs a full sync. Continue on error.
-        continue-on-error: true
-
-      - name: Sync marker
-        shell: pwsh
-        run: |
-          Write-Host "Sync job finished. Full src is NOT uploaded (too large for artifacts). Build job restores cache-dir when present."
-
-  build:
-    name: Build + pack on Windows ARM
-    needs: [probe, sync]
-    # Run even when sync was skipped; fail if sync failed (unless skipped).
-    if: ${{ always() && needs.probe.result == 'success' && (needs.sync.result == 'success' || needs.sync.result == 'skipped') }}
-    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     steps:
       - name: Disk / arch preflight
@@ -174,6 +108,8 @@ jobs:
             Write-Warning "vswhere not found"
           }
 
+      # Stable key (no run_id): next run can restore. Same-job handoff no longer needed.
+      # Prefer v3; fall back to v2 keys from prior multi-stage runs when present.
       - name: Restore depot_tools + gclient cache
         id: cache_restore
         uses: actions/cache/restore@v4
@@ -182,14 +118,16 @@ jobs:
           path: |
             ${{ runner.temp }}/depot_tools
             ${{ runner.temp }}/gclient-cache
-          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-${{ github.run_id }}
+          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}
           restore-keys: |
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-
 
-      # Run 35866577988: actions/cache reported hit then Azure auth failed mid-download;
-      # step still exited 0 with empty dirs — verify on disk before trusting cache-hit.
+      # Run 35866577988: cache "hit" then Azure auth failed mid-download; verify on disk.
       - name: Verify cache restore on disk
         id: cache_ok
         shell: pwsh
@@ -206,7 +144,7 @@ jobs:
             'present=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
             'present=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Warning 'Cache restore left empty dirs (or miss). Will retry once.'
+            Write-Warning 'Cache restore empty or miss; will cold-sync (budget risk under 6h).'
           }
 
       - name: Retry restore depot_tools + gclient cache
@@ -217,16 +155,20 @@ jobs:
           path: |
             ${{ runner.temp }}/depot_tools
             ${{ runner.temp }}/gclient-cache
-          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-${{ github.run_id }}
+          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}
           restore-keys: |
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
             ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-
+            v2-winarm-gclient-${{ env.CHROME_TAG }}-
 
-      - name: Build Chromium (tag 151.0.7922.34 / arm64)
+      - name: Sync + Build Chromium (tag 151.0.7922.34 / arm64)
         shell: pwsh
         env:
           DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+          DEPOT_TOOLS_UPDATE: '0'
           AGGRESSIVE_DISK: '1'
           DELETE_GIT_AFTER_SYNC: ${{ inputs.delete_git_after_sync && '1' || '0' }}
           DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
@@ -280,7 +222,7 @@ jobs:
             | Package | `${{ env.PACKAGE_STEM }}` |
 
             Runner: `${{ inputs.runner }}` (AtlasGraph reference label: `windows-11-arm`).
-            Pipeline: multi-stage sync cache + build (hosted 6h/job cap).
+            Pipeline: single-job sync + build (hosted 6h/job cap; avoids cross-job cache handoff).
 
             **Not** Google Chrome / Microsoft Edge. Chromium BSD-style license applies to the binary.
           files: |
@@ -291,3 +233,15 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Save after success path mostly; still try after pack so next run warms faster.
+      # If cache >~10GB, save may fail — continue so Release is not blocked.
+      - name: Save depot_tools + gclient cache
+        if: ${{ success() || failure() }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/depot_tools
+            ${{ runner.temp }}/gclient-cache
+          key: ${{ env.CACHE_SCHEMA }}-winarm-gclient-${{ env.CHROME_TAG }}-${{ runner.os }}-${{ inputs.runner }}-${{ github.run_id }}

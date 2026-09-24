@@ -81,12 +81,20 @@ function Repair-GclientCacheDirSpec {
 
 function Ensure-DepotTools {
   Write-Info "DEPOT_TOOLS=$DepotTools"
+  # Disable auto-update: concurrent "Updating depot_tools..." from gclient/fetch races on
+  # .git/index.lock (failed run 35921596181 right after cold clone).
+  $env:DEPOT_TOOLS_UPDATE = '0'
   if (-not (Test-Path (Join-Path $DepotTools 'gclient.bat')) -and -not (Test-Path (Join-Path $DepotTools 'gclient'))) {
     Write-Info "Cloning depot_tools..."
     $parent = Split-Path $DepotTools -Parent
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DepotTools
     if ($LASTEXITCODE -ne 0) { throw "git clone depot_tools failed: $LASTEXITCODE" }
+  }
+  $lock = Join-Path $DepotTools '.git\index.lock'
+  if (Test-Path $lock) {
+    Write-Warn "Removing stale depot_tools .git/index.lock"
+    Remove-Item -Force $lock -ErrorAction SilentlyContinue
   }
   $env:Path = "$DepotTools;" + $env:Path
   $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
@@ -97,7 +105,7 @@ function Ensure-DepotTools {
     $env:GIT_CACHE_PATH = $GclientCache
     Write-Info "GIT_CACHE_PATH / GCLIENT_CACHE_DIR=$GclientCache (forward-slash for .gclient)"
   }
-  Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0"
+  Write-Info "DEPOT_TOOLS_WIN_TOOLCHAIN=0 DEPOT_TOOLS_UPDATE=0"
   Write-Info "depot_tools ready (gclient on PATH)"
   & gclient help 2>$null | Select-Object -First 1 | Out-Host
 }
